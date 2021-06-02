@@ -17,7 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/google/uuid"
+	"github.com/gofrs/uuid"
 )
 
 type key int
@@ -203,7 +203,7 @@ func (c *conn) killQuery(req *http.Request, args []driver.Value) error {
 	}
 	ctx, cancelFunc := context.WithTimeout(context.Background(), timeout)
 	defer cancelFunc()
-	req, err := c.buildRequest(ctx, query, args)
+	req, err := c.buildRequest(ctx, query, args, false)
 	if err != nil {
 		return err
 	}
@@ -223,7 +223,7 @@ func (c *conn) query(ctx context.Context, query string, args []driver.Value) (dr
 	if atomic.LoadInt32(&c.closed) != 0 {
 		return nil, driver.ErrBadConn
 	}
-	req, err := c.buildRequest(ctx, query, args)
+	req, err := c.buildRequest(ctx, query, args, true)
 	if err != nil {
 		return nil, err
 	}
@@ -245,7 +245,7 @@ func (c *conn) exec(ctx context.Context, query string, args []driver.Value) (dri
 	if atomic.LoadInt32(&c.closed) != 0 {
 		return nil, driver.ErrBadConn
 	}
-	req, err := c.buildRequest(ctx, query, args)
+	req, err := c.buildRequest(ctx, query, args, false)
 	if err != nil {
 		return nil, err
 	}
@@ -285,29 +285,41 @@ func (c *conn) doRequest(ctx context.Context, req *http.Request) (io.ReadCloser,
 	return resp.Body, nil
 }
 
-func (c *conn) buildRequest(ctx context.Context, query string, params []driver.Value) (*http.Request, error) {
-	var err error
+func (c *conn) buildRequest(ctx context.Context, query string, params []driver.Value, readonly bool) (*http.Request, error) {
+	var (
+		method string
+		err    error
+	)
 	if len(params) > 0 {
 		if query, err = interpolateParams(query, params); err != nil {
 			return nil, err
 		}
 	}
 
-	bodyReader, bodyWriter := io.Pipe()
-	go func() {
-		if c.useGzipCompression {
-			gz := gzip.NewWriter(bodyWriter)
-			gz.Write([]byte(query))
-			gz.Close()
-			bodyWriter.Close()
-		} else {
-			bodyWriter.Write([]byte(query))
-			bodyWriter.Close()
-		}
-	}()
+	var (
+		bodyReader io.Reader
+		bodyWriter io.WriteCloser
+	)
+	if readonly {
+		method = http.MethodGet
+	} else {
+		method = http.MethodPost
+		bodyReader, bodyWriter = io.Pipe()
+		go func() {
+			if c.useGzipCompression {
+				gz := gzip.NewWriter(bodyWriter)
+				gz.Write([]byte(query))
+				gz.Close()
+				bodyWriter.Close()
+			} else {
+				bodyWriter.Write([]byte(query))
+				bodyWriter.Close()
+			}
+		}()
+	}
 	c.log("query: ", query)
 
-	req, err := http.NewRequest(http.MethodPost, c.url.String(), bodyReader)
+	req, err := http.NewRequest(method, c.url.String(), bodyReader)
 	if err != nil {
 		return nil, err
 	}
@@ -329,7 +341,12 @@ func (c *conn) buildRequest(ctx context.Context, query string, params []driver.V
 		}
 		queryID, queryOk := ctx.Value(QueryID).(string)
 		if c.killQueryOnErr && (!queryOk || queryID == "") {
-			queryID = uuid.New().String()
+			queryUUID, err := uuid.NewV4()
+			if err != nil {
+				c.log("can't generate query_id: ", err)
+			} else {
+				queryID = queryUUID.String()
+			}
 		}
 		if queryID != "" {
 			if reqQuery == nil {
@@ -339,11 +356,17 @@ func (c *conn) buildRequest(ctx context.Context, query string, params []driver.V
 		}
 
 	}
+	if method == http.MethodGet {
+		if reqQuery == nil {
+			reqQuery = req.URL.Query()
+		}
+		reqQuery.Add("query", query)
+	}
 	if reqQuery != nil {
 		req.URL.RawQuery = reqQuery.Encode()
 	}
 
-	if c.useGzipCompression {
+	if method == http.MethodPost && c.useGzipCompression {
 		req.Header.Set("Content-Encoding", "gzip")
 	}
 

@@ -15,7 +15,7 @@ func (c *conn) Ping(ctx context.Context) error {
 		return ErrTransportNil
 	}
 
-	req, err := c.buildRequest(ctx, "select 1", nil)
+	req, err := c.buildRequest(ctx, "select 1", nil, true)
 	if err != nil {
 		return err
 	}
